@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NextGen Telegram voting giveaway bot - SINGLE FILE edition, verification fix v2.
+"""NextGen Telegram voting giveaway bot - SINGLE FILE edition, payment fix v2 + entry protection v3.
 
 Python 3.10 or newer required.
 Install dependencies once (no requirements file needed):
@@ -17,8 +17,15 @@ Private file: contains the supplied FamGateway test key. Do not share publicly.
 Rotate the shared test key before production deployment.
 Payment settings: /admin -> Payment Gateway (root-owner private chat).
 Admin-panel payment values override the initial values in this file.
+Entry protection: /admin -> Entry Protection. Words, links, and @mentions are
+blocked in new entry/display names by default. Admins can edit the word list or
+toggle each filter. Add/remove words one per line or comma-separated.
+The starter list contains common English/Hinglish profanity; customize it for
+your community. Existing entries are not retroactively removed.
+No finite text filter can detect every possible obfuscated spelling; add custom
+words/phrases to the list when needed.
 
-Checks: compilation, static analysis, 47 offline regressions and read-only live paid-order verification.
+Checks: compilation, static analysis, 82 offline regressions and read-only live paid-order verification.
 Fix v2: accepts both flat and nested FamGateway verification envelopes.
 Upgrade: stop the old process, keep your existing BOT_TOKEN/MONGODB_URI/database
 and ROOT_ADMIN_IDS, then start this script. Existing pending orders need no new
@@ -36,6 +43,8 @@ import hashlib
 import hmac
 import logging
 import re
+import unicodedata
+from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -111,6 +120,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "paid_vote_pack_price": 1,
     "paid_vote_pack_votes": 2,
     "paid_vote_min_votes": 20,
+    "entry_word_filter_enabled": True,
+    "entry_block_links": True,
+    "entry_block_usernames": True,
+    "entry_banned_words": [
+        "fuck", "fucker", "fucking", "shit", "bitch", "asshole", "bastard",
+        "chutiya", "madarchod", "behenchod", "bhosdike", "gandu",
+    ],
 }
 
 logging.basicConfig(
@@ -2369,6 +2385,10 @@ class AdminAddAdminState(StatesGroup):
     waiting_user_id = State()
 
 
+class AdminModerationState(StatesGroup):
+    waiting_words = State()
+
+
 class AdminPaymentState(StatesGroup):
     waiting_value = State()
 
@@ -3583,13 +3603,97 @@ async def delete_participant(participant: dict[str, Any], giveaway: dict[str, An
     await db.participants.delete_one({"_id": participant["_id"]})
 
 
+# Entry-name moderation is intentionally separate from channel/post link inputs,
+# owner broadcasts, payment URLs and Telegram profile usernames.
+MAX_ENTRY_BANNED_WORDS = 500
+MAX_ENTRY_BANNED_WORD_LENGTH = 80
+_SMALLCAP_REVERSE = {value: key for key, value in _SMALL_CAPS.items()}
+_MOD_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s", "!": "i"})
+
+
+def normalize_entry_text(text: str) -> str:
+    # NFKC handles fullwidth/mathematical letters. Strip invisible/bidi format
+    # controls without removing vowel marks used in Indian names.
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(_SMALLCAP_REVERSE.get(ch, ch) for ch in value if unicodedata.category(ch) != "Cf")
+
+
+def canonical_banned_word(text: str) -> str:
+    return " ".join(normalize_entry_text(text).translate(_MOD_LEET).split())
+
+
+@lru_cache(maxsize=1024)
+def banned_entry_pattern(word: str) -> re.Pattern:
+    # Literal words/phrases, never administrator-supplied regular expressions.
+    # Catch spaced/punctuated spelling, with word boundaries
+    # so a short banned word does not reject an innocent longer name.
+    letters = [ch for ch in canonical_banned_word(word) if ch.isalnum() or unicodedata.category(ch).startswith("M")]
+    body = r"[\W_]*".join(re.escape(ch) for ch in letters)
+    if not letters:
+        body = r"(?!)"
+    return re.compile(r"(?<!\w)" + body + r"(?!\w)", re.UNICODE)
+
+
+def entry_has_link(text: str) -> bool:
+    value = normalize_entry_text(text).replace("。", ".").replace("｡", ".").replace("．", ".")
+    value = re.sub(r"\[\s*dot\s*\]|\(\s*dot\s*\)", ".", value, flags=re.I)
+    # Spaces in a written protocol / well-known Telegram link are still links.
+    if re.search(r"(?:https?|hxxps?|ftp|tg)\s*:\s*(?:[/\\]\s*){1,2}|www\s*\.", value):
+        return True
+    if re.search(r"(?<!\w)(?:t|telegram)\s*\.\s*(?:me|dog)(?!\w)", value):
+        return True
+    if re.search(r"(?<![\w@])(?:[\w](?:[\w-]{0,62})\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]+)(?![\w-])", value):
+        return True
+    if re.search(r"(?<!\w)(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?(?!\w)", value):
+        return True
+    return False
+
+
+def entry_moderation_reason(text: str, settings: dict[str, Any], entities: Any = None) -> str | None:
+    normalized = normalize_entry_text(text)
+    if settings.get("entry_block_links", True):
+        if entry_has_link(normalized):
+            return "Links and website addresses are not allowed in giveaway entry names."
+        for entity in entities or []:
+            kind = str(getattr(getattr(entity, "type", ""), "value", getattr(entity, "type", "")))
+            if kind in {"url", "text_link", "email"}:
+                return "Links and hidden links are not allowed in giveaway entry names."
+    if settings.get("entry_block_usernames", True):
+        if re.search(r"@\s*[\w]", normalized):
+            return "@usernames and mentions are not allowed in giveaway entry names."
+        for entity in entities or []:
+            kind = str(getattr(getattr(entity, "type", ""), "value", getattr(entity, "type", "")))
+            if kind in {"mention", "text_mention"}:
+                return "Usernames and hidden mentions are not allowed in giveaway entry names."
+    if settings.get("entry_word_filter_enabled", True):
+        candidate = normalized.translate(_MOD_LEET)
+        words = settings.get("entry_banned_words", DEFAULT_SETTINGS["entry_banned_words"])
+        if not isinstance(words, list):
+            words = DEFAULT_SETTINGS["entry_banned_words"]
+        for word in words[:MAX_ENTRY_BANNED_WORDS]:
+            if isinstance(word, str) and word.strip() and banned_entry_pattern(word[:MAX_ENTRY_BANNED_WORD_LENGTH]).search(candidate):
+                return "This name contains a blocked word. Send a different, clean name."
+    return None
+
+
 @router.message(CandidateNameState.waiting_name)
 async def handle_candidate_name(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     giveaway_id = oid(data.get("giveaway_id"))
-    name = " ".join((message.text or "").split())
+    raw_name = message.text or ""
+    if len(raw_name) > 500:
+        await message.answer("Send a name between 1 and 80 characters.")
+        return
+    # Preserve the user's visible spelling/case, while deleting invisible controls.
+    name = " ".join("".join(ch for ch in unicodedata.normalize("NFKC", raw_name) if unicodedata.category(ch) != "Cf").split())
     if not name or len(name) > 80:
         await message.answer("Send a name between 1 and 80 characters. New lines are not allowed.")
+        return
+    moderation_settings = await global_settings()
+    reason = entry_moderation_reason(raw_name, moderation_settings, getattr(message, "entities", None))
+    if reason:
+        # Keep the conversation in waiting_name; nothing is inserted/published.
+        await message.answer(reason + "\nPlease send another name.", reply_markup=simple_keyboard(("Cancel", "cancel")))
         return
     if not giveaway_id:
         await state.clear()
@@ -4318,6 +4422,7 @@ def admin_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [ui_button(text="User Controls", callback_data="admin:users"), ui_button(text="Broadcast To Users", callback_data="admin:broadcast-users")],
         [ui_button(text="Broadcast To Channels", callback_data="admin:broadcast-channels")],
         [ui_button(text="Payment Gateway", callback_data="admin:payment-gateway")],
+        [ui_button(text="Entry Protection", callback_data="admin:entry-protection")],
     ]
     if is_root_admin(user_id):
         rows.append([ui_button(text="Manage Admins", callback_data="admin:admins"), ui_button(text="Main Menu", callback_data="menu:home")])
@@ -4480,6 +4585,157 @@ async def cb_admin_monetization(callback: CallbackQuery) -> None:
         [ui_button(text="Back", callback_data="admin:home")],
     ]
     await safe_edit(callback.message, f"{heading('Monetization Settings')}\n\nEdit Premium duration and price, and the paid-vote rate and minimum.", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+def entry_protection_keyboard(settings: dict[str, Any]) -> InlineKeyboardMarkup:
+    rows = []
+    for field, label in (("words", "Banned Words"), ("links", "Block Links"), ("usernames", "Block Usernames")):
+        key = {"words": "entry_word_filter_enabled", "links": "entry_block_links", "usernames": "entry_block_usernames"}[field]
+        rows.append([ui_button(text=f"{label}: {'ON' if settings.get(key, True) else 'OFF'}", callback_data=f"admin:entry-toggle:{field}")])
+    rows.extend([
+        [ui_button(text="Add Banned Words", callback_data="admin:entry-words:add")],
+        [ui_button(text="Remove Banned Words", callback_data="admin:entry-words:remove")],
+        [ui_button(text="View Banned Words", callback_data="admin:entry-word-list:0")],
+        [ui_button(text="Back", callback_data="admin:home")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_entry_protection(callback: CallbackQuery) -> None:
+    settings = await global_settings()
+    count = len(settings.get("entry_banned_words", DEFAULT_SETTINGS["entry_banned_words"]))
+    text = (
+        f"{heading('Giveaway Entry Protection')}\n\n"
+        f"<b>Blocked words:</b> {count}\n"
+        "Filters check new giveaway entry/display names, including replacement entries. "
+        "Bad words, website links and @mentions can be blocked independently.\n\n"
+        "Settings apply to all users, including admins entering a name. Telegram profile usernames are not account bans. "
+        "Existing entries are not deleted or modified retroactively."
+    )
+    await safe_edit(callback.message, text, entry_protection_keyboard(settings))
+
+
+@router.callback_query(F.data == "admin:entry-protection")
+async def cb_admin_entry_protection(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id) or callback.message.chat.type != "private":
+        await safe_answer(callback, "Open this panel as an admin in private chat.", alert=True)
+        return
+    await safe_answer(callback)
+    await state.clear()
+    await show_entry_protection(callback)
+
+
+@router.callback_query(F.data.startswith("admin:entry-toggle:"))
+async def cb_admin_entry_toggle(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id) or callback.message.chat.type != "private":
+        await safe_answer(callback, "Not allowed.", alert=True)
+        return
+    field = str(callback.data).rsplit(":", 1)[-1]
+    key = {"words": "entry_word_filter_enabled", "links": "entry_block_links", "usernames": "entry_block_usernames"}.get(field)
+    if not key:
+        return
+    await safe_answer(callback)
+    await state.clear()
+    # Atomically toggle against the stored value (or the enabled-by-default value).
+    await db.settings.update_one(
+        {"_id": "global"},
+        [{"$set": {key: {"$eq": [{"$ifNull": ["$" + key, True]}, False]}, "entry_filter_updated_at": now_utc(), "entry_filter_updated_by": callback.from_user.id}}],
+        upsert=True,
+    )
+    await show_entry_protection(callback)
+
+
+@router.callback_query(F.data.startswith("admin:entry-words:"))
+async def cb_admin_entry_words(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id) or callback.message.chat.type != "private":
+        await safe_answer(callback, "Not allowed.", alert=True)
+        return
+    action = str(callback.data).rsplit(":", 1)[-1]
+    if action not in {"add", "remove"}:
+        return
+    await safe_answer(callback)
+    await state.set_state(AdminModerationState.waiting_words)
+    await state.update_data(entry_words_action=action)
+    await safe_edit(callback.message,
+        f"Send words/phrases to {action}, one per line or comma-separated. "
+        f"Maximum {MAX_ENTRY_BANNED_WORDS} words, {MAX_ENTRY_BANNED_WORD_LENGTH} characters each. "
+        "Matching is case-insensitive; entries are literal words, not regex patterns.",
+        simple_keyboard(("Cancel", "admin:entry-protection")),
+    )
+
+
+@router.message(AdminModerationState.waiting_words)
+async def handle_admin_entry_words(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id) or message.chat.type != "private":
+        await state.clear()
+        return
+    action = (await state.get_data()).get("entry_words_action")
+    if action not in {"add", "remove"}:
+        await state.clear()
+        return
+    raw = message.text or ""
+    if not raw or len(raw) > 12000:
+        await message.answer("Send a text list, maximum 12,000 characters.")
+        return
+    words = sorted({canonical_banned_word(item) for item in re.split(r"[,\n]+", raw) if item.strip()})
+    if not words or len(words) > MAX_ENTRY_BANNED_WORDS or any(len(word) > MAX_ENTRY_BANNED_WORD_LENGTH or not any(ch.isalnum() for ch in word) for word in words):
+        await message.answer("Invalid list. Use 1-500 literal words/phrases, at most 80 characters each, containing letters or numbers.")
+        return
+    # Seed defaults on existing databases only if the field does not exist.
+    await global_settings()
+    await db.settings.update_one(
+        {"_id": "global", "entry_banned_words": {"$exists": False}},
+        {"$set": {"entry_banned_words": DEFAULT_SETTINGS["entry_banned_words"]}},
+    )
+    fields = {"entry_filter_updated_at": now_utc(), "entry_filter_updated_by": message.from_user.id}
+    if action == "add":
+        # One atomic pipeline prevents lost edits and enforces the list size even
+        # when two admins submit lists at the same time. $literal treats $ safely.
+        combined = {"$setUnion": [{"$ifNull": ["$entry_banned_words", []]}, {"$literal": words}]}
+        await db.settings.update_one(
+            {"_id": "global"},
+            [{"$set": {**fields, "entry_banned_words": {"$cond": [{"$lte": [{"$size": combined}, MAX_ENTRY_BANNED_WORDS]}, combined, "$entry_banned_words"]}}}],
+        )
+        latest = await global_settings()
+        stored = set(latest.get("entry_banned_words", []))
+        if not set(words).issubset(stored):
+            await message.answer("Word limit reached. Nothing from this batch was added. Remove some words and retry.")
+            return
+    else:
+        await db.settings.update_one(
+            {"_id": "global"},
+            {"$pull": {"entry_banned_words": {"$in": words}}, "$set": fields},
+        )
+    await state.clear()
+    await message.answer("Banned-word list updated. New entries use the changes immediately.",
+                         reply_markup=simple_keyboard(("Entry Protection", "admin:entry-protection")))
+
+
+@router.callback_query(F.data.startswith("admin:entry-word-list:"))
+async def cb_admin_entry_word_list(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id) or callback.message.chat.type != "private":
+        await safe_answer(callback, "Not allowed.", alert=True)
+        return
+    raw_page = str(callback.data).rsplit(":", 1)[-1]
+    if not raw_page.isdigit() or len(raw_page) > 5:
+        return
+    await safe_answer(callback)
+    settings = await global_settings()
+    words = sorted(str(word) for word in settings.get("entry_banned_words", []))
+    page_size = 8  # Escaping and long words must still fit a photo caption.
+    pages = max(1, (len(words) + page_size - 1) // page_size)
+    page = min(int(raw_page), pages - 1)
+    listing = "\n".join(f"• {esc(word[:80])}" for word in words[page * page_size:(page + 1) * page_size]) or "No blocked words."
+    rows = []
+    nav = []
+    if page:
+        nav.append(ui_button(text="Previous", callback_data=f"admin:entry-word-list:{page-1}"))
+    if page + 1 < pages:
+        nav.append(ui_button(text="Next", callback_data=f"admin:entry-word-list:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([ui_button(text="Back", callback_data="admin:entry-protection")])
+    await safe_edit(callback.message, f"{heading('Banned Words')} ({page+1}/{pages})\n\n{listing}", InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.callback_query(F.data == "admin:payment-gateway")
