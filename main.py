@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NextGen Telegram voting giveaway bot - SINGLE FILE edition.
+"""NextGen Telegram voting giveaway bot - SINGLE FILE edition, verification fix v2.
 
 Python 3.10 or newer required.
 Install dependencies once (no requirements file needed):
@@ -18,7 +18,11 @@ Rotate the shared test key before production deployment.
 Payment settings: /admin -> Payment Gateway (root-owner private chat).
 Admin-panel payment values override the initial values in this file.
 
-Checks: compilation, static analysis and 34 offline regression tests.
+Checks: compilation, static analysis, 47 offline regressions and read-only live paid-order verification.
+Fix v2: accepts both flat and nested FamGateway verification envelopes.
+Upgrade: stop the old process, keep your existing BOT_TOKEN/MONGODB_URI/database
+and ROOT_ADMIN_IDS, then start this script. Existing pending orders need no new
+payment; their Verify Payment button remains compatible.
 Real Telegram/MongoDB startup and live paid fulfillment require valid credentials
 and deployment testing. No software can guarantee zero errors in all environments.
 """
@@ -1221,11 +1225,30 @@ def _payment_payload_data(payload: Any) -> dict[str, Any]:
     return payload
 
 
-def payment_status_from_payload(payload: Any) -> str:
-    # Creation status=success is NOT proof of payment. Only verification callers
-    # can settle, and settlement additionally requires order ID, amount and UTR.
+def payment_status_value(payload: Any) -> str:
+    """Read lifecycle status from flat or nested authenticated verify responses.
+
+    FamGateway may return {status: success, data: {order_id, amount, utr}}
+    without data.status. An explicit nested lifecycle status takes precedence
+    over an outer transport-success status. Unknown explicit values stay unknown
+    so callers can reject malformed responses instead of crediting a payment.
+    """
+    if not isinstance(payload, dict):
+        return ""
     data = _payment_payload_data(payload)
-    status = str(data.get("payment_status") or data.get("order_status") or data.get("status") or "").strip().casefold()
+    sources = [data] if data is payload else [data, payload]
+    for source in sources:
+        for field in ("payment_status", "order_status", "transaction_status", "status"):
+            value = source.get(field)
+            if value is not None and str(value).strip():
+                return str(value).strip().casefold()
+    return ""
+
+
+def payment_status_from_payload(payload: Any) -> str:
+    # Never use create-order success alone for fulfillment. Settlement additionally
+    # requires an authenticated verify response with matching order/amount + UTR.
+    status = payment_status_value(payload)
     if status in {"success", "paid"}:
         return "success"
     if status in {"failed", "failure"}:
@@ -1322,12 +1345,14 @@ async def famgateway_verify_order(
                 if not isinstance(body, dict):
                     raise PaymentProviderError("FamGateway returned an invalid verification response.")
                 # A documented 408 is a genuine expiry, not a network failure.
-                if response.status == 408 and str(body.get("status", "")).lower() == "expired":
+                if response.status == 408 and payment_status_value(body) == "expired":
                     return {"status": "expired", "order_id": str(order_id)}
                 if response.status != 200:
                     raise PaymentProviderError("FamGateway verification is temporarily unavailable. Check the API key/integration if this persists.")
+                if str(body.get("status", "")).strip().casefold() in {"error", "unauthorized", "not_found", "suspended"}:
+                    raise PaymentProviderError("FamGateway could not verify this order. Check the merchant key and integration.")
                 data = _payment_payload_data(body)
-                if str(data.get("status", "")).lower() not in {"success", "pending", "expired", "failed", "paid"}:
+                if payment_status_value(body) not in {"success", "pending", "expired", "failed", "paid", "failure", "cancelled", "canceled"}:
                     raise PaymentProviderError("FamGateway has not returned a valid payment status.")
                 returned_id = str(data.get("order_id") or "").strip()
                 if returned_id and returned_id != str(order_id):
@@ -1689,8 +1714,14 @@ async def _settle_verified_payment(payment: dict[str, Any], verification: dict[s
     verified_data = _payment_payload_data(verification)
     verified_order_id = str(verified_data.get("order_id") or "").strip()
     verified_amount = verified_data.get("amount", verified_data.get("pay_amount"))
+    actual_amount = verified_data.get("actual_paid_amount")
+    if actual_amount is None or actual_amount == "":
+        actual_amount = verified_data.get("settled_amount")
     try:
-        amount_matches = payment_money(verified_amount) == payment_money(current.get("amount_inr"))
+        expected_amount = payment_money(current.get("amount_inr"))
+        amount_matches = payment_money(verified_amount) == expected_amount
+        if actual_amount is not None and actual_amount != "":
+            amount_matches = amount_matches and payment_money(actual_amount) == expected_amount
     except PaymentProviderError:
         amount_matches = False
     if verified_order_id != order_id or not amount_matches:
@@ -1906,6 +1937,10 @@ async def _check_one_payment(payment: dict[str, Any], semaphore: asyncio.Semapho
             await db.payments.update_one({"_id": payment["_id"]}, {"$set": {"last_check_at": now_utc()}})
             response = await famgateway_verify_order(str(payment.get("provider_order_id", "")), api_key=payment.get("provider_api_key"))
             status = payment_status_from_payload(response)
+            await db.payments.update_one(
+                {"_id": payment["_id"]},
+                {"$set": {"last_provider_status": status, "last_verified_check_at": now_utc()}},
+            )
             if status == "success":
                 await settle_verified_payment(payment, response)
             elif status in {"expired", "failed"}:
@@ -1978,6 +2013,10 @@ async def cb_verify_payment(callback: CallbackQuery) -> None:
         await safe_answer(callback, "Could not verify right now. Automatic status checking will continue.", alert=True)
         return
     status = payment_status_from_payload(verification)
+    await db.payments.update_one(
+        {"_id": payment["_id"]},
+        {"$set": {"last_provider_status": status, "last_verified_check_at": now_utc()}},
+    )
     if status == "success":
         await safe_answer(callback, "Payment confirmed. Applying your purchase now.")
         try:
