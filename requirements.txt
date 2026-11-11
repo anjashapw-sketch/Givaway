@@ -1,0 +1,6 @@
+# NextGen Telegram Giveaway Bot — dependencies
+# Python 3.10+ required
+
+aiogram==3.31.0
+aiohttp==3.14.5
+pymongo==4.19.0
