@@ -57,7 +57,7 @@ def _int_or_zero(value: str) -> int:
 
 
 # ── identity & host ─────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9234967804:AAGv-0ay8mps2dGkjAyTTz0Qmlv9nU4lfqQ").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9234967804:AAGXIt5ow_W8d0ie_j34zcxOBadnrnuXs9E").strip()
 BRAND = os.getenv("BRAND_NAME", "TG MANDI GIVEAWAYS").strip()
 HOST_NAME = os.getenv("HOST_NAME", "TG MANDI").strip()
 BRAND_TAG = os.getenv("BRAND_TAG", f"Hosted by {HOST_NAME}").strip()
